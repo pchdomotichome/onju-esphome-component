@@ -1,0 +1,9 @@
+{
+  "name": "onju",
+  "version": "1.0.0",
+  "description": "Onju protocol component for ESPHome — μ-law UDP, TCP binary protocol, wake word, LEDs, touch",
+  "author": "Domus",
+  "url": "https://github.com/domus/onju-esphome",
+  "esphome_component": true,
+  "dependencies": []
+}
