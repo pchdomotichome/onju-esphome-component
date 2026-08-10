@@ -92,9 +92,12 @@ void OnjuProtocol::setup() {
   int enable = 1;
   udp_->setsockopt(SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int));
   udp_->setsockopt(SOL_SOCKET, SO_BROADCAST, &enable, sizeof(int));
-  struct sockaddr_storage addr;
-  socklen_t sl = socket::set_sockaddr_any((struct sockaddr *) &addr, sizeof(addr), udp_port_);
-  if (udp_->bind((struct sockaddr *) &addr, sl) != 0) {
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  addr.sin_port = htons(udp_port_);
+  if (udp_->bind((struct sockaddr *) &addr, sizeof(addr)) != 0) {
     this->status_set_error(LOG_STR("UDP bind failed"));
     this->mark_failed();
     return;
@@ -110,9 +113,12 @@ void OnjuProtocol::setup() {
   }
   tcp_server_->setsockopt(SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int));
   tcp_server_->setblocking(false);
-  struct sockaddr_storage tcp_addr;
-  socklen_t tcp_sl = socket::set_sockaddr_any((struct sockaddr *) &tcp_addr, sizeof(tcp_addr), tcp_port_);
-  if (tcp_server_->bind((struct sockaddr *) &tcp_addr, tcp_sl) != 0) {
+  struct sockaddr_in tcp_addr;
+  memset(&tcp_addr, 0, sizeof(tcp_addr));
+  tcp_addr.sin_family = AF_INET;
+  tcp_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  tcp_addr.sin_port = htons(tcp_port_);
+  if (tcp_server_->bind((struct sockaddr *) &tcp_addr, sizeof(tcp_addr)) != 0) {
     this->status_set_error(LOG_STR("TCP bind failed"));
     this->mark_failed();
     return;
