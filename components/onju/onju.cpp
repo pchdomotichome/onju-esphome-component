@@ -142,6 +142,13 @@ void OnjuProtocol::setup() {
   tcp_server_->listen(2);
   ESP_LOGCONFIG(TAG, "TCP server on port %d", tcp_port_);
 
+  // FIX VAD: server_address_ configurada es el destino upstream por defecto.
+  // Sin esto, el audio del mic solo fluiría mientras haya una conexión TCP
+  // abierta (server_ip_str_ se llenaba solo con la IP del peer y se limpiaba
+  // al desconectar), y la wake word armaba el mic sin enviar nunca audio.
+  if (!server_address_.empty())
+    server_ip_str_ = server_address_;
+
   // FIX #1: registrar callback del micrófono
   setup_mic_callback();
 
@@ -279,13 +286,13 @@ void OnjuProtocol::poll_tcp_header() {
     ESP_LOGW(TAG, "Servidor cerró la conexión TCP");
     tcp_client_->close();
     tcp_client_.reset();
-    server_ip_str_.clear();
+    // No se limpia server_ip_str_: el audio upstream sigue yendo a la IP
+    // configurada (server_address_) o a la última IP del servidor conocida.
   } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
     // Error real
     ESP_LOGW(TAG, "TCP read error: %d", errno);
     tcp_client_->close();
     tcp_client_.reset();
-    server_ip_str_.clear();
   }
   // EAGAIN/EWOULDBLOCK: no hay datos aún, volver en el próximo loop()
 }
