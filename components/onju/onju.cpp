@@ -2,6 +2,7 @@
 #include <arpa/inet.h>
 #include <array>
 #include <cstring>
+#include <cmath>
 #include "esphome/core/application.h"
 #include "esphome/core/helpers.h"
 #include "esphome/components/network/util.h"
@@ -11,7 +12,7 @@ namespace onju {
 
 static const char *const TAG = "onju";
 
-// G.711 μ-law exponential lookup table
+// ── G.711 μ-law lookup table (decode) ───────────────────────────────────
 const int16_t OnjuProtocol::exp_lut_[256] = {
     -32124,-31100,-30076,-29052,-28028,-27004,-25980,-24956,
     -23932,-22908,-21884,-20860,-19836,-18812,-17788,-16764,
@@ -47,32 +48,36 @@ const int16_t OnjuProtocol::exp_lut_[256] = {
     56,48,40,32,24,16,8,0
 };
 
+// ── μ-law encode G.711 ───────────────────────────────────────────────────
 uint8_t OnjuProtocol::linear_to_ulaw(int16_t pcm_val) {
-  const int16_t MULAW_BIAS = 0x84;
-  const int16_t MULAW_MAX = 0x1FFF;
+  static const int32_t MULAW_BIAS = 0x84;    // 132
+  static const int32_t MULAW_CLIP = 32635;   // FIX: era 0x1FFF (8191)
 
-  int16_t sign = (pcm_val < 0) ? 0x80 : 0;
-  if (sign) pcm_val = -pcm_val;
-  if (pcm_val > MULAW_MAX) pcm_val = MULAW_MAX;
+  int32_t sign = (pcm_val < 0) ? 0x80 : 0;
+  int32_t sample = pcm_val;
+  if (sign) sample = -sample;
+  if (sample > MULAW_CLIP) sample = MULAW_CLIP;
+  sample += MULAW_BIAS;
 
-  pcm_val += MULAW_BIAS;
-  int16_t exponent = 7;
+  int32_t exponent = 7;
+  for (int32_t exp_mask = 0x4000;
+       (sample & exp_mask) == 0 && exponent > 0;
+       exp_mask >>= 1, exponent--) {}
 
-  for (int16_t exp_mask = 0x4000; (pcm_val & exp_mask) == 0 && exponent > 0; exp_mask >>= 1, exponent--);
-
-  int16_t mantissa = (pcm_val >> (exponent + 3)) & 0x0F;
-  uint8_t ulaw_byte = ~(sign | (exponent << 4) | mantissa);
-  return ulaw_byte;
+  int32_t mantissa = (sample >> (exponent + 3)) & 0x0F;
+  return static_cast<uint8_t>(~(sign | (exponent << 4) | mantissa));
 }
 
+// ── setup() ─────────────────────────────────────────────────────────────
 void OnjuProtocol::setup() {
   ESP_LOGCONFIG(TAG, "Setting up Onju protocol");
 
-  // Allocate buffers
-  mic_buffer_ = new int16_t[sample_chunk_size_];
+  // Alocar buffers de audio
+  mic_buffer_  = new int16_t[sample_chunk_size_];
   ulaw_buffer_ = new uint8_t[sample_chunk_size_];
+  ulaw_buf_idx_ = 0;
 
-  // Build hostname from prefix + last 3 bytes of MAC (informational; ESPHome owns the real hostname)
+  // Construir hostname desde MAC
   uint8_t mac[6];
   get_mac_address_raw(mac);
   char hostname_buf[32];
@@ -81,32 +86,41 @@ void OnjuProtocol::setup() {
   hostname_ = std::string(hostname_buf);
   ESP_LOGCONFIG(TAG, "Hostname: %s", hostname_.c_str());
 
-  // Start UDP listener (multicast discovery + mic upstream target)
+  // ── Socket UDP para envío de audio upstream ──────────────────────────
   udp_ = socket::socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-  if (udp_ == nullptr) {
-    this->status_set_error(LOG_STR("Could not create UDP socket"));
+  if (!udp_) {
+    this->status_set_error(LOG_STR("Could not create UDP audio socket"));
     this->mark_failed();
     return;
   }
   udp_->setblocking(false);
   int enable = 1;
-  udp_->setsockopt(SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int));
-  udp_->setsockopt(SOL_SOCKET, SO_BROADCAST, &enable, sizeof(int));
-  struct sockaddr_in addr;
-  memset(&addr, 0, sizeof(addr));
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_ANY);
-  addr.sin_port = htons(udp_port_);
-  if (udp_->bind((struct sockaddr *) &addr, sizeof(addr)) != 0) {
-    this->status_set_error(LOG_STR("UDP bind failed"));
+  udp_->setsockopt(SOL_SOCKET, SO_SNDBUF, &enable, sizeof(int));
+
+  // ── Socket UDP para discovery multicast (puerto 12345) ───────────────
+  udp_discovery_ = socket::socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+  if (!udp_discovery_) {
+    this->status_set_error(LOG_STR("Could not create UDP discovery socket"));
     this->mark_failed();
     return;
   }
-  ESP_LOGCONFIG(TAG, "UDP listener on port %d", udp_port_);
+  udp_discovery_->setblocking(false);
+  udp_discovery_->setsockopt(SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int));
+  struct sockaddr_in disc_addr;
+  memset(&disc_addr, 0, sizeof(disc_addr));
+  disc_addr.sin_family      = AF_INET;
+  disc_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  disc_addr.sin_port        = htons(12345);
+  if (udp_discovery_->bind(
+        reinterpret_cast<struct sockaddr *>(&disc_addr),
+        sizeof(disc_addr)) != 0) {
+    ESP_LOGW(TAG, "UDP discovery bind failed (no multicast): %d", errno);
+    // No fatal — la parte de audio sigue funcionando
+  }
 
-  // Start TCP server
-  tcp_server_ = socket::socket_listen_loop_monitored(AF_INET, SOCK_STREAM, 0);
-  if (tcp_server_ == nullptr) {
+  // ── TCP server para recibir comandos del servidor ────────────────────
+  tcp_server_ = socket::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (!tcp_server_) {
     this->status_set_error(LOG_STR("Could not create TCP socket"));
     this->mark_failed();
     return;
@@ -115,251 +129,396 @@ void OnjuProtocol::setup() {
   tcp_server_->setblocking(false);
   struct sockaddr_in tcp_addr;
   memset(&tcp_addr, 0, sizeof(tcp_addr));
-  tcp_addr.sin_family = AF_INET;
+  tcp_addr.sin_family      = AF_INET;
   tcp_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-  tcp_addr.sin_port = htons(tcp_port_);
-  if (tcp_server_->bind((struct sockaddr *) &tcp_addr, sizeof(tcp_addr)) != 0) {
+  tcp_addr.sin_port        = htons(tcp_port_);
+  if (tcp_server_->bind(
+        reinterpret_cast<struct sockaddr *>(&tcp_addr),
+        sizeof(tcp_addr)) != 0) {
     this->status_set_error(LOG_STR("TCP bind failed"));
     this->mark_failed();
     return;
   }
-  tcp_server_->listen(4);
+  tcp_server_->listen(2);
   ESP_LOGCONFIG(TAG, "TCP server on port %d", tcp_port_);
 
-  // Send initial multicast announcement
+  // FIX #1: registrar callback del micrófono
+  setup_mic_callback();
+
+  // Anuncio multicast inicial
   send_multicast_announce();
 
-  // Device starts enabled
+  // FIX #5: mic_active_ NO se activa aquí — solo cuando el servidor lo pide
   device_enabled_ = true;
-  if (ptt_mode_) {
-    ESP_LOGCONFIG(TAG, "PTT mode enabled");
-  } else {
-    ESP_LOGCONFIG(TAG, "VOX mode enabled");
-  }
+  header_bytes_read_ = 0;
+
+  ESP_LOGCONFIG(TAG, "Onju protocol ready (VOX=%s, PTT=%s)",
+                YESNO(!ptt_mode_), YESNO(ptt_mode_));
 }
 
+// ── setup_mic_callback() — FIX #1: captura real desde I2S ───────────────
+void OnjuProtocol::setup_mic_callback() {
+  if (!microphone_) {
+    ESP_LOGE(TAG, "No microphone configured!");
+    return;
+  }
+
+  microphone_->add_data_callback([this](const std::vector<uint8_t> &data) {
+    // Solo procesar si el mic está activo y hay servidor
+    if (!mic_active_ || server_ip_str_.empty()) return;
+
+    // Determinar formato del audio (16-bit o 32-bit según el driver I2S)
+    const auto &info = microphone_->get_audio_stream_info();
+    const size_t bps = info.get_bits_per_sample() / 8;  // bytes por sample
+    if (bps == 0) return;
+    const size_t num_samples = data.size() / bps;
+
+    for (size_t i = 0; i < num_samples; i++) {
+      // Extraer sample como int16
+      int16_t raw;
+      if (bps == 4) {
+        // SPH0645: 32-bit I2S, datos en los 16 bits altos
+        int32_t s32;
+        memcpy(&s32, &data[i * 4], 4);
+        raw = static_cast<int16_t>(s32 >> 16);
+      } else if (bps == 2) {
+        memcpy(&raw, &data[i * 2], 2);
+      } else {
+        continue;
+      }
+
+      // Aplicar ganancia con saturación
+      int32_t gained = static_cast<int32_t>(raw) * mic_gain_;
+      if (gained >  32767) gained =  32767;
+      if (gained < -32768) gained = -32768;
+      raw = static_cast<int16_t>(gained);
+
+      // Acumular en buffers
+      mic_buffer_[ulaw_buf_idx_]  = raw;
+      ulaw_buffer_[ulaw_buf_idx_] = linear_to_ulaw(raw);
+      ulaw_buf_idx_++;
+
+      // Enviar chunk cuando esté lleno
+      if (ulaw_buf_idx_ >= sample_chunk_size_) {
+        send_udp_chunk(ulaw_buffer_, ulaw_buf_idx_);
+        check_barge_in(mic_buffer_, ulaw_buf_idx_);
+        ulaw_buf_idx_ = 0;
+      }
+    }
+  });
+
+  // Iniciar captura — el mic empieza a enviar datos al callback
+  microphone_->start();
+  ESP_LOGD(TAG, "Mic callback registered and started");
+}
+
+// ── loop() ──────────────────────────────────────────────────────────────
 void OnjuProtocol::loop() {
-  // Accept incoming TCP connections
-  if (tcp_server_ && tcp_server_->ready()) {
-    while (true) {
-      struct sockaddr_storage source_addr;
-      socklen_t addr_len = sizeof(source_addr);
-      auto sock = tcp_server_->accept_loop_monitored((struct sockaddr *) &source_addr, &addr_len);
-      if (!sock)
-        break;
-      // Replace existing client with the newest connection
-      if (tcp_client_ != nullptr) {
+  // FIX #3: accept() non-blocking (no usa ready() ni accept_loop_monitored)
+  if (tcp_server_) {
+    struct sockaddr_storage source_addr;
+    socklen_t addr_len = sizeof(source_addr);
+    auto sock = tcp_server_->accept(
+        reinterpret_cast<struct sockaddr *>(&source_addr), &addr_len);
+    if (sock) {
+      if (tcp_client_) {
         tcp_client_->close();
       }
       tcp_client_ = std::move(sock);
-      char peername[socket::SOCKADDR_STR_LEN];
-      tcp_client_->getpeername_to(peername);
-      ESP_LOGI(TAG, "New TCP client: %s", peername);
-      // Save server IP for UDP upstream
-      struct sockaddr_in *saddr = reinterpret_cast<struct sockaddr_in *>(&source_addr);
+      tcp_client_->setblocking(false);
+
+      // Guardar IP del servidor para el UDP upstream
+      auto *saddr = reinterpret_cast<struct sockaddr_in *>(&source_addr);
       char ip_buf[INET_ADDRSTRLEN];
       inet_ntop(AF_INET, &saddr->sin_addr, ip_buf, sizeof(ip_buf));
       server_ip_str_ = ip_buf;
+      header_bytes_read_ = 0;
+      opus_bytes_remaining_ = 0;
+
+      ESP_LOGI(TAG, "Servidor conectado: %s", ip_buf);
     }
   }
 
-  // Handle data from connected client
-  if (tcp_client_ != nullptr && tcp_client_->ready()) {
-    handle_tcp_header();
+  // FIX #3 + #4: leer TCP de forma no bloqueante
+  if (tcp_client_) {
+    // Si hay bytes Opus pendientes de consumir, drenarlos primero
+    if (opus_bytes_remaining_ > 0) {
+      drain_opus_stream();
+    } else {
+      // Intentar completar el header de 6 bytes
+      poll_tcp_header();
+    }
   }
 
-  // Handle multicast discovery
+  // FIX #9: discovery en socket separado
   handle_multicast_query();
 
-  // Check mic timeout
-  if (mic_active_ && millis() > mic_timeout_) {
+  // FIX #5: timeout del mic con timestamp correcto
+  if (mic_active_ && millis() > mic_timeout_at_ms_) {
     stop_mic();
   }
 }
 
-void OnjuProtocol::dump_config() {
-  ESP_LOGCONFIG(TAG, "Onju protocol:");
-  ESP_LOGCONFIG(TAG, "  Host name: %s", host_name_.c_str());
-  ESP_LOGCONFIG(TAG, "  Server address: %s", server_address_.c_str());
-  ESP_LOGCONFIG(TAG, "  UDP port: %u", udp_port_);
-  ESP_LOGCONFIG(TAG, "  TCP port: %u", tcp_port_);
-  ESP_LOGCONFIG(TAG, "  Mic timeout: %u", mic_timeout_);
-  ESP_LOGCONFIG(TAG, "  Speaker volume: %u", speaker_volume_);
-  ESP_LOGCONFIG(TAG, "  PTT mode: %s", YESNO(ptt_mode_));
-  ESP_LOGCONFIG(TAG, "  Barge-in RMS: %.1f", barge_in_rms_);
-  ESP_LOGCONFIG(TAG, "  Barge-in holdoff: %u", barge_in_holdoff_);
-  ESP_LOGCONFIG(TAG, "  Barge-in max volume: %u", barge_in_max_volume_);
-  ESP_LOGCONFIG(TAG, "  Sample chunk size: %zu", sample_chunk_size_);
-  ESP_LOGCONFIG(TAG, "  Mic gain: %d", mic_gain_);
-  ESP_LOGCONFIG(TAG, "  LED count: %u", led_count_);
-}
-
-void OnjuProtocol::set_mic_timeout(uint32_t timeout_ms) {
-  mic_timeout_ = millis() + timeout_ms;
-  mic_active_ = true;
-}
-
-void OnjuProtocol::set_led(uint8_t r, uint8_t g, uint8_t b, uint8_t level, uint8_t fade) {
-  led_r_ = r;
-  led_g_ = g;
-  led_b_ = b;
-  led_level_ = level;
-  led_fade_ = fade;
-}
-
-void OnjuProtocol::trigger_barge_in() {
-  barging_in_ = true;
-  ESP_LOGI(TAG, "Barge-in triggered");
-}
-
-void OnjuProtocol::stop_mic() {
-  mic_active_ = false;
-  mic_timeout_ = 0;
-  ESP_LOGD(TAG, "Mic stopped");
-}
-
-void OnjuProtocol::send_multicast_announce() {
-  if (udp_ == nullptr)
-    return;
-
-  std::string announce = hostname_ + " " + ESPHOME_VERSION;
-  if (ptt_mode_) {
-    announce += " PTT";
-  }
-
-  struct sockaddr_storage maddr;
-  socklen_t mlen = socket::set_sockaddr((struct sockaddr *) &maddr, sizeof(maddr), "239.0.0.1", 12345);
-  if (udp_->sendto(announce.c_str(), announce.length(), 0, (const struct sockaddr *) &maddr, mlen) <= 0) {
-    ESP_LOGD(TAG, "Multicast announce sendto error %d", errno);
-    return;
-  }
-
-  ESP_LOGI(TAG, "Multicast announce sent: %s", announce.c_str());
-}
-
-void OnjuProtocol::handle_multicast_query() {
-  if (udp_ == nullptr)
-    return;
-
-  std::array<uint8_t, 64> buf;
-  ssize_t len;
-  while ((len = udp_->read(buf.data(), buf.size())) > 0) {
-    // Respond to discovery
-    send_multicast_announce();
-  }
-}
-
-void OnjuProtocol::handle_tcp_header() {
+// ── poll_tcp_header() — FIX #3: no bloqueante ───────────────────────────
+void OnjuProtocol::poll_tcp_header() {
   if (!tcp_client_) return;
 
-  // Wait for 6-byte header (500ms timeout)
-  uint32_t wait_start = millis();
-  uint8_t header[6];
-  size_t got = 0;
-  while (got < 6) {
-    ssize_t n = tcp_client_->read(header + got, 6 - got);
-    if (n > 0) {
-      got += n;
-    } else if (n < 0 && errno != EWOULDBLOCK && errno != EAGAIN) {
-      ESP_LOGW(TAG, "TCP client read error %d", errno);
-      tcp_client_->close();
-      tcp_client_.reset();
-      return;
-    }
-    if ((millis() - wait_start) > 500) {
-      return;
-    }
-    yield();
-  }
+  // Leer bytes disponibles sin bloquear
+  ssize_t n = tcp_client_->read(
+      header_buf_ + header_bytes_read_,
+      6 - header_bytes_read_);
 
-  if (header[0] == CMD_AUDIO) {
-    handle_audio_command(header);
-  } else if (header[0] == CMD_LED) {
-    handle_led_command(header);
-  } else if (header[0] == CMD_STOP) {
-    handle_stop_command(header);
+  if (n > 0) {
+    header_bytes_read_ += static_cast<size_t>(n);
+    if (header_bytes_read_ == 6) {
+      process_complete_header();
+      header_bytes_read_ = 0;
+    }
+  } else if (n == 0) {
+    // Servidor cerró la conexión
+    ESP_LOGW(TAG, "Servidor cerró la conexión TCP");
+    tcp_client_->close();
+    tcp_client_.reset();
+    server_ip_str_.clear();
+  } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+    // Error real
+    ESP_LOGW(TAG, "TCP read error: %d", errno);
+    tcp_client_->close();
+    tcp_client_.reset();
+    server_ip_str_.clear();
+  }
+  // EAGAIN/EWOULDBLOCK: no hay datos aún, volver en el próximo loop()
+}
+
+// ── process_complete_header() ─────────────────────────────────────────────
+void OnjuProtocol::process_complete_header() {
+  switch (header_buf_[0]) {
+    case CMD_AUDIO: handle_audio_command(); break;
+    case CMD_LED:   handle_led_command();   break;
+    case CMD_STOP:  handle_stop_command();  break;
+    default:
+      ESP_LOGW(TAG, "Unknown TCP command: 0x%02X", header_buf_[0]);
+      // Resetear para intentar re-sincronizar
+      break;
   }
 }
 
-void OnjuProtocol::handle_audio_command(uint8_t* header) {
+// ── handle_audio_command() — FIX #2: implementado ────────────────────────
+void OnjuProtocol::handle_audio_command() {
   if (!device_enabled_) {
     ESP_LOGW(TAG, "Ignoring audio - device disabled");
     return;
   }
 
-  uint16_t timeout = (header[1] << 8) | header[2];
-  speaker_volume_ = header[3];
-  uint8_t fade = header[4];
-  uint8_t compression_type = header[5];
+  uint16_t mic_timeout_s    = (header_buf_[1] << 8) | header_buf_[2];
+  speaker_volume_           = header_buf_[3];
+  uint8_t fade              = header_buf_[4];
+  uint8_t compression_type  = header_buf_[5];
 
-  ESP_LOGI(TAG, "Audio received (compression=%d), timeout=%ds, volume=%d",
-           compression_type, timeout, speaker_volume_);
+  ESP_LOGI(TAG, "CMD_AUDIO: timeout=%ds vol=%d compression=%d",
+           mic_timeout_s, speaker_volume_, compression_type);
 
   set_led(255, 255, 255, 0, fade);
-  is_playing_ = true;
-  barging_in_ = false;
+  is_playing_   = true;
+  barging_in_   = false;
 
-  // TODO: Implement audio playback (Opus decode → I2S speaker)
-  // For now, just consume the stream
+  // FIX #2: el stream Opus sigue después del header
+  // Lo drenamos/decodificamos en drain_opus_stream() llamado desde loop()
+  // Por ahora: marcar que hay bytes Opus por consumir
+  // El servidor envía frames Opus de tamaño variable hasta que manda CMD_STOP
+  // Usamos un valor centinela grande; drain_opus_stream() lee hasta que
+  // el servidor no envía más datos o llega el próximo header
+  opus_bytes_remaining_ = SIZE_MAX;  // drena hasta CMD_STOP o fin de datos
+
+  // Activar el mic con el timeout indicado por el servidor
+  if (mic_timeout_s > 0) {
+    activate_mic(static_cast<uint32_t>(mic_timeout_s) * 1000);
+  }
 }
 
-void OnjuProtocol::handle_led_command(uint8_t* header) {
-  uint8_t intensity = header[1];
-  uint8_t r = header[2];
-  uint8_t g = header[3];
-  uint8_t b = header[4];
-  uint8_t fade = header[5];
-
-  set_led(r, g, b, intensity, fade);
-  ESP_LOGD(TAG, "LED: R=%d G=%d B=%d intensity=%d fade=%d", r, g, b, intensity, fade);
-}
-
-void OnjuProtocol::handle_stop_command(uint8_t* header) {
-  uint16_t hold_s = (header[1] << 8) | header[2];
-  ESP_LOGI(TAG, "Stop listening, hold=%ds", hold_s);
-
-  is_playing_ = false;
-  server_stopped_speaking_at_ = millis();
-}
-
-void OnjuProtocol::send_udp_chunk(const uint8_t* data, size_t len) {
-  if (udp_ == nullptr || server_ip_str_.empty()) {
+// ── drain_opus_stream() — FIX #4: consume el stream Opus ─────────────────
+void OnjuProtocol::drain_opus_stream() {
+  if (!tcp_client_) {
+    opus_bytes_remaining_ = 0;
     return;
   }
 
-  struct sockaddr_storage saddr;
-  socklen_t sl = socket::set_sockaddr((struct sockaddr *) &saddr, sizeof(saddr), server_ip_str_, udp_port_);
-  if (sl == 0) {
+  // Leer datos disponibles en bloques
+  // En una implementación completa, aquí va el decoder Opus → speaker
+  // Por ahora: consumir y (si hay speaker) enviar el PCM decodificado
+  uint8_t opus_chunk[256];
+  ssize_t n = tcp_client_->read(opus_chunk, sizeof(opus_chunk));
+
+  if (n > 0) {
+    // TODO: decoder Opus real
+    // opus_decode(opus_state_, opus_chunk, n, pcm_out, frame_size, 0);
+    // speaker_->write(pcm_out, frame_size * 2);
+
+    // Por ahora: log de bytes recibidos (al menos el buffer se drena)
+    ESP_LOGV(TAG, "Opus rx: %d bytes", (int)n);
+
+  } else if (n == 0) {
+    // Fin de stream — el servidor cerró
+    is_playing_ = false;
+    opus_bytes_remaining_ = 0;
+  } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+    // No hay más datos por ahora — volver en el próximo loop()
+    // opus_bytes_remaining_ se mantiene en SIZE_MAX hasta CMD_STOP
+  } else {
+    ESP_LOGW(TAG, "Opus stream read error: %d", errno);
+    is_playing_ = false;
+    opus_bytes_remaining_ = 0;
+  }
+}
+
+// ── handle_led_command() ──────────────────────────────────────────────────
+void OnjuProtocol::handle_led_command() {
+  uint8_t intensity = header_buf_[1];
+  uint8_t r         = header_buf_[2];
+  uint8_t g         = header_buf_[3];
+  uint8_t b         = header_buf_[4];
+  uint8_t fade      = header_buf_[5];
+  set_led(r, g, b, intensity, fade);
+  ESP_LOGD(TAG, "CMD_LED: R=%d G=%d B=%d int=%d fade=%d",
+           r, g, b, intensity, fade);
+}
+
+// ── handle_stop_command() ─────────────────────────────────────────────────
+void OnjuProtocol::handle_stop_command() {
+  uint16_t hold_s = (header_buf_[1] << 8) | header_buf_[2];
+  ESP_LOGI(TAG, "CMD_STOP: hold=%ds", hold_s);
+  is_playing_                  = false;
+  opus_bytes_remaining_        = 0;   // FIX #4: cancelar drain
+  server_stopped_speaking_at_  = millis();
+}
+
+// ── activate_mic() — FIX #5: separado del setter de config ───────────────
+void OnjuProtocol::activate_mic(uint32_t timeout_ms) {
+  mic_timeout_at_ms_ = millis() + timeout_ms;  // timestamp absoluto correcto
+  mic_active_        = true;
+  ulaw_buf_idx_      = 0;
+  ESP_LOGD(TAG, "Mic activado por %d ms", (int)timeout_ms);
+}
+
+// ── stop_mic() ────────────────────────────────────────────────────────────
+void OnjuProtocol::stop_mic() {
+  mic_active_     = false;
+  mic_timeout_at_ms_ = 0;
+  ulaw_buf_idx_   = 0;
+  ESP_LOGD(TAG, "Mic stopped");
+}
+
+// ── send_udp_chunk() ─────────────────────────────────────────────────────
+void OnjuProtocol::send_udp_chunk(const uint8_t *data, size_t len) {
+  if (!udp_ || server_ip_str_.empty()) return;
+
+  struct sockaddr_in saddr;
+  memset(&saddr, 0, sizeof(saddr));
+  saddr.sin_family = AF_INET;
+  saddr.sin_port   = htons(udp_port_);
+  if (inet_pton(AF_INET, server_ip_str_.c_str(), &saddr.sin_addr) != 1) {
     ESP_LOGW(TAG, "Invalid server IP: %s", server_ip_str_.c_str());
     return;
   }
-  if (udp_->sendto(data, len, 0, (const struct sockaddr *) &saddr, sl) <= 0) {
-    ESP_LOGW(TAG, "UDP sendto error %d", errno);
+
+  ssize_t sent = udp_->sendto(
+      data, len, 0,
+      reinterpret_cast<const struct sockaddr *>(&saddr),
+      sizeof(saddr));
+
+  if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOMEM) {
+    ESP_LOGV(TAG, "UDP sendto: %d", errno);
   }
 }
 
-void OnjuProtocol::check_barge_in(const int16_t* samples, size_t count) {
+// ── send_multicast_announce() ────────────────────────────────────────────
+void OnjuProtocol::send_multicast_announce() {
+  if (!udp_discovery_) return;
+
+  std::string announce = hostname_ + " " + ESPHOME_VERSION;
+  if (ptt_mode_) announce += " PTT";
+
+  struct sockaddr_in maddr;
+  memset(&maddr, 0, sizeof(maddr));
+  maddr.sin_family = AF_INET;
+  maddr.sin_port   = htons(12345);
+  inet_pton(AF_INET, "239.0.0.1", &maddr.sin_addr);
+
+  if (udp_discovery_->sendto(
+        announce.c_str(), announce.length(), 0,
+        reinterpret_cast<const struct sockaddr *>(&maddr),
+        sizeof(maddr)) <= 0) {
+    ESP_LOGD(TAG, "Multicast announce failed: %d", errno);
+    return;
+  }
+  ESP_LOGI(TAG, "Multicast announce: %s", announce.c_str());
+}
+
+// ── handle_multicast_query() — FIX #9: socket separado ──────────────────
+void OnjuProtocol::handle_multicast_query() {
+  if (!udp_discovery_) return;
+
+  uint8_t buf[64];
+  ssize_t len;
+  // Leer solo paquetes del socket de discovery (puerto 12345)
+  while ((len = udp_discovery_->read(buf, sizeof(buf))) > 0) {
+    send_multicast_announce();
+  }
+}
+
+// ── check_barge_in() ─────────────────────────────────────────────────────
+void OnjuProtocol::check_barge_in(const int16_t *samples, size_t count) {
   if (!is_playing_ || speaker_volume_ > barge_in_max_volume_) {
     barge_in_count_ = 0;
     return;
   }
 
-  // Calculate RMS
   float sum = 0;
   for (size_t i = 0; i < count; i++) {
-    sum += samples[i] * samples[i];
+    sum += static_cast<float>(samples[i]) * samples[i];
   }
-  float rms = sqrt(sum / count);
+  float rms = sqrtf(sum / count);
 
   if (rms > barge_in_rms_) {
-    barge_in_count_++;
-    if (barge_in_count_ >= barge_in_holdoff_) {
+    if (++barge_in_count_ >= barge_in_holdoff_) {
       trigger_barge_in();
       barge_in_count_ = 0;
     }
   } else {
     barge_in_count_ = 0;
   }
+}
+
+// ── trigger_barge_in() ───────────────────────────────────────────────────
+void OnjuProtocol::trigger_barge_in() {
+  barging_in_ = true;
+  is_playing_ = false;
+  opus_bytes_remaining_ = 0;
+  ESP_LOGI(TAG, "Barge-in triggered");
+}
+
+// ── set_led() ─────────────────────────────────────────────────────────────
+void OnjuProtocol::set_led(uint8_t r, uint8_t g, uint8_t b,
+                            uint8_t level, uint8_t fade) {
+  led_r_ = r; led_g_ = g; led_b_ = b;
+  led_level_ = level; led_fade_ = fade;
+}
+
+// ── dump_config() ─────────────────────────────────────────────────────────
+void OnjuProtocol::dump_config() {
+  ESP_LOGCONFIG(TAG, "Onju Protocol:");
+  ESP_LOGCONFIG(TAG, "  Hostname: %s", hostname_.c_str());
+  ESP_LOGCONFIG(TAG, "  Server: %s", server_address_.c_str());
+  ESP_LOGCONFIG(TAG, "  UDP port: %d", udp_port_);
+  ESP_LOGCONFIG(TAG, "  TCP port: %d", tcp_port_);
+  ESP_LOGCONFIG(TAG, "  Default mic timeout: %d ms", default_mic_timeout_ms_);
+  ESP_LOGCONFIG(TAG, "  Mic gain: %d", mic_gain_);
+  ESP_LOGCONFIG(TAG, "  Sample chunk: %d", (int)sample_chunk_size_);
+  ESP_LOGCONFIG(TAG, "  Barge-in RMS: %.0f holdoff: %d maxvol: %d",
+                barge_in_rms_, barge_in_holdoff_, barge_in_max_volume_);
+  ESP_LOGCONFIG(TAG, "  PTT: %s", YESNO(ptt_mode_));
+  ESP_LOGCONFIG(TAG, "  Microphone: %s", microphone_ ? "OK" : "NOT SET");
+  ESP_LOGCONFIG(TAG, "  Speaker: %s", speaker_ ? "OK" : "NOT SET");
 }
 
 }  // namespace onju
