@@ -6,6 +6,7 @@
 #include "esphome/core/application.h"
 #include "esphome/core/helpers.h"
 #include "esphome/components/network/util.h"
+#include "esphome/components/audio/audio.h"
 
 namespace esphome {
 namespace onju {
@@ -320,10 +321,10 @@ void OnjuProtocol::handle_audio_command() {
   uint16_t mic_timeout_s    = (header_buf_[1] << 8) | header_buf_[2];
   speaker_volume_           = header_buf_[3];
   uint8_t fade              = header_buf_[4];
-  uint8_t compression_type  = header_buf_[5];
+  compression_type_         = header_buf_[5];
 
   ESP_LOGI(TAG, "CMD_AUDIO: timeout=%ds vol=%d compression=%d",
-           mic_timeout_s, speaker_volume_, compression_type);
+           mic_timeout_s, speaker_volume_, compression_type_);
 
   set_led(255, 255, 255, 0, fade);
   is_playing_   = true;
@@ -336,6 +337,13 @@ void OnjuProtocol::handle_audio_command() {
   // Usamos un valor centinela grande; drain_opus_stream() lee hasta que
   // el servidor no envía más datos o llega el próximo header
   opus_bytes_remaining_ = SIZE_MAX;  // drena hasta CMD_STOP o fin de datos
+
+  // TTS: si el server manda PCM16 crudo (16kHz mono), preparar el speaker.
+  // El resampler del device sube de 16kHz a 48kHz automáticamente.
+  if (compression_type_ == 0 && speaker_ != nullptr) {
+    speaker_->set_audio_stream_info(audio::AudioStreamInfo(16, 1, 16000));
+    speaker_->start();
+  }
 
   // Activar el mic con el timeout indicado por el servidor
   if (mic_timeout_s > 0) {
@@ -357,15 +365,19 @@ void OnjuProtocol::drain_opus_stream() {
   ssize_t n = tcp_client_->read(opus_chunk, sizeof(opus_chunk));
 
   if (n > 0) {
-    // TODO: decoder Opus real
-    // opus_decode(opus_state_, opus_chunk, n, pcm_out, frame_size, 0);
-    // speaker_->write(pcm_out, frame_size * 2);
-
-    // Por ahora: log de bytes recibidos (al menos el buffer se drena)
-    ESP_LOGV(TAG, "Opus rx: %d bytes", (int)n);
+    if (compression_type_ == 0 && speaker_ != nullptr) {
+      // PCM16 crudo: escribir directo al speaker (el resampler sube a 48kHz)
+      speaker_->play(opus_chunk, static_cast<size_t>(n));
+    } else {
+      // TODO: decoder Opus real
+      // opus_decode(opus_state_, opus_chunk, n, pcm_out, frame_size, 0);
+      // speaker_->write(pcm_out, frame_size * 2);
+      ESP_LOGV(TAG, "Opus rx: %d bytes", (int)n);
+    }
 
   } else if (n == 0) {
     // Fin de stream — el servidor cerró
+    if (speaker_ != nullptr) speaker_->finish();
     is_playing_ = false;
     opus_bytes_remaining_ = 0;
   } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -373,6 +385,7 @@ void OnjuProtocol::drain_opus_stream() {
     // opus_bytes_remaining_ se mantiene en SIZE_MAX hasta CMD_STOP
   } else {
     ESP_LOGW(TAG, "Opus stream read error: %d", errno);
+    if (speaker_ != nullptr) speaker_->finish();
     is_playing_ = false;
     opus_bytes_remaining_ = 0;
   }
@@ -397,6 +410,7 @@ void OnjuProtocol::handle_stop_command() {
   is_playing_                  = false;
   opus_bytes_remaining_        = 0;   // FIX #4: cancelar drain
   server_stopped_speaking_at_  = millis();
+  if (speaker_ != nullptr) speaker_->finish();
 }
 
 // ── activate_mic() — FIX #5: separado del setter de config ───────────────

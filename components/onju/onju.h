@@ -105,6 +105,7 @@ class OnjuProtocol : public Component {
   // FIX #2: buffer de audio Opus downstream para consumir el stream
   std::vector<uint8_t> opus_rx_buf_;
   size_t opus_bytes_remaining_    = 0;       // bytes Opus aún por consumir/decodificar
+  uint8_t compression_type_       = 0;       // 0 = PCM16 crudo, 2 = Opus (TTS downstream)
 
   // FIX #3: estado de lectura TCP no bloqueante
   uint8_t  header_buf_[6];
