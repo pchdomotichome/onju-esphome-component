@@ -140,7 +140,10 @@ void OnjuProtocol::setup() {
     this->mark_failed();
     return;
   }
-  tcp_server_->listen(2);
+  // Cola de accept amplia: el pipeline abre una conexión por chunk de TTS y el
+  // loop() puede tardar más que la cadencia entre chunks. Con backlog chico el SYN
+  // se descarta, el cliente reintenta al segundo y se oye un hueco.
+  tcp_server_->listen(8);
   ESP_LOGCONFIG(TAG, "TCP server on port %d", tcp_port_);
 
   // FIX VAD: server_address_ configurada es el destino upstream por defecto.
