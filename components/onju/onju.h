@@ -102,10 +102,15 @@ class OnjuProtocol : public Component {
   uint8_t *ulaw_buffer_           = nullptr;
   size_t   ulaw_buf_idx_          = 0;       // índice actual en el chunk
 
-  // FIX #2: buffer de audio Opus downstream para consumir el stream
-  std::vector<uint8_t> opus_rx_buf_;
-  size_t opus_bytes_remaining_    = 0;       // bytes Opus aún por consumir/decodificar
-  uint8_t compression_type_       = 0;       // 0 = PCM16 crudo, 2 = Opus (TTS downstream)
+  // Downstream: una conexión TCP = header de 6 bytes + payload, y EOF al cerrar.
+  // El payload se acumula acá y se le entrega al speaker sólo lo que acepta.
+  static constexpr size_t AUDIO_RX_SIZE = 4096;
+  uint8_t  audio_rx_[AUDIO_RX_SIZE] = {};
+  size_t   audio_rx_len_           = 0;      // bytes pendientes de entregar al speaker
+  bool     audio_streaming_        = false;  // leyendo el payload de CMD_AUDIO
+  bool     speaker_finish_pending_ = false;  // payload terminado, speaker aún drenando
+  uint32_t speaker_empty_since_ms_ = 0;
+  uint8_t  compression_type_       = 0;      // 0 = PCM16 crudo, 2 = Opus (no soportado)
 
   // FIX #3: estado de lectura TCP no bloqueante
   uint8_t  header_buf_[6];
@@ -131,8 +136,9 @@ class OnjuProtocol : public Component {
   void handle_led_command();
   void handle_stop_command();
 
-  // FIX #4: consumir stream Opus no bloqueante
-  void drain_opus_stream();
+  // FIX #4: consumir el payload PCM no bloqueante, respetando el ring buffer
+  void drain_audio_stream();
+  void end_audio_stream();
 
   void send_udp_chunk(const uint8_t *data, size_t len);
   void setup_mic_callback();         // registra add_data_callback en setup()

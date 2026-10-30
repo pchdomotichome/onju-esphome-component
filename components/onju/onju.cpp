@@ -223,7 +223,9 @@ void OnjuProtocol::setup_mic_callback() {
 // ── loop() ──────────────────────────────────────────────────────────────
 void OnjuProtocol::loop() {
   // FIX #3: accept() non-blocking (no usa ready() ni accept_loop_monitored)
-  if (tcp_server_) {
+  // No aceptar otra conexión con el payload anterior a medio leer: close() en el
+  // accept() descartaría la cola que quedó en el buffer de recepción del socket.
+  if (tcp_server_ && !audio_streaming_) {
     struct sockaddr_storage source_addr;
     socklen_t addr_len = sizeof(source_addr);
     auto sock = tcp_server_->accept(
@@ -241,21 +243,38 @@ void OnjuProtocol::loop() {
       inet_ntop(AF_INET, &saddr->sin_addr, ip_buf, sizeof(ip_buf));
       server_ip_str_ = ip_buf;
       header_bytes_read_ = 0;
-      opus_bytes_remaining_ = 0;
 
       ESP_LOGI(TAG, "Servidor conectado: %s", ip_buf);
     }
   }
 
+  // Cerrar el stream anterior sólo cuando el grafo ya reprodujo todo:
+  // finish() corta lo que quedó aguas abajo (mixer 250 ms + hardware 100 ms).
+  if (speaker_finish_pending_) {
+    if (speaker_ == nullptr) {
+      speaker_finish_pending_ = false;
+      is_playing_ = false;
+    } else if (speaker_->has_buffered_data()) {
+      speaker_empty_since_ms_ = 0;
+    } else if (speaker_empty_since_ms_ == 0) {
+      speaker_empty_since_ms_ = millis();
+    } else if (millis() - speaker_empty_since_ms_ > 400) {
+      speaker_->finish();
+      speaker_finish_pending_ = false;
+      is_playing_ = false;
+    }
+  }
+
   // FIX #3 + #4: leer TCP de forma no bloqueante
   if (tcp_client_) {
-    // Si hay bytes Opus pendientes de consumir, drenarlos primero
-    if (opus_bytes_remaining_ > 0) {
-      drain_opus_stream();
+    if (audio_streaming_) {
+      drain_audio_stream();
     } else {
       // Intentar completar el header de 6 bytes
       poll_tcp_header();
     }
+  } else if (audio_streaming_) {
+    drain_audio_stream();  // sin socket: sólo queda entregar el staging
   }
 
   // FIX #9: discovery en socket separado
@@ -330,19 +349,24 @@ void OnjuProtocol::handle_audio_command() {
   is_playing_   = true;
   barging_in_   = false;
 
-  // FIX #2: el stream Opus sigue después del header
-  // Lo drenamos/decodificamos en drain_opus_stream() llamado desde loop()
-  // Por ahora: marcar que hay bytes Opus por consumir
-  // El servidor envía frames Opus de tamaño variable hasta que manda CMD_STOP
-  // Usamos un valor centinela grande; drain_opus_stream() lee hasta que
-  // el servidor no envía más datos o llega el próximo header
-  opus_bytes_remaining_ = SIZE_MAX;  // drena hasta CMD_STOP o fin de datos
+  // FIX #2: el payload sigue al header; termina con EOF (una conexión por mensaje)
+  audio_streaming_ = true;
+  speaker_finish_pending_ = false;  // hay audio nuevo: no cerrar el stream anterior
+
+  // El volumen real del grafo (resampler → mixer → hardware) sale del byte 'vol'.
+  // vol=0 lo usa el servidor para reabrir el mic sin audio: no pisamos el volumen.
+  if (speaker_ != nullptr && speaker_volume_ > 0) {
+    speaker_->set_volume(speaker_volume_ / 31.0f);
+  }
 
   // TTS: si el server manda PCM16 crudo (16kHz mono), preparar el speaker.
   // El resampler del device sube de 16kHz a 48kHz automáticamente.
   if (compression_type_ == 0 && speaker_ != nullptr) {
     speaker_->set_audio_stream_info(audio::AudioStreamInfo(16, 1, 16000));
     speaker_->start();
+  } else if (compression_type_ != 0) {
+    ESP_LOGW(TAG, "compression=%d no soportada: mandar PCM16 (compression=0)",
+             compression_type_);
   }
 
   // Activar el mic con el timeout indicado por el servidor
@@ -351,44 +375,58 @@ void OnjuProtocol::handle_audio_command() {
   }
 }
 
-// ── drain_opus_stream() — FIX #4: consume el stream Opus ─────────────────
-void OnjuProtocol::drain_opus_stream() {
-  if (!tcp_client_) {
-    opus_bytes_remaining_ = 0;
-    return;
-  }
-
-  // Leer datos disponibles en bloques
-  // En una implementación completa, aquí va el decoder Opus → speaker
-  // Por ahora: consumir y (si hay speaker) enviar el PCM decodificado
-  uint8_t opus_chunk[256];
-  ssize_t n = tcp_client_->read(opus_chunk, sizeof(opus_chunk));
-
-  if (n > 0) {
-    if (compression_type_ == 0 && speaker_ != nullptr) {
-      // PCM16 crudo: escribir directo al speaker (el resampler sube a 48kHz)
-      speaker_->play(opus_chunk, static_cast<size_t>(n));
-    } else {
-      // TODO: decoder Opus real
-      // opus_decode(opus_state_, opus_chunk, n, pcm_out, frame_size, 0);
-      // speaker_->write(pcm_out, frame_size * 2);
-      ESP_LOGV(TAG, "Opus rx: %d bytes", (int)n);
+// ── drain_audio_stream() — payload PCM → speaker con backpressure ────────
+void OnjuProtocol::drain_audio_stream() {
+  // 1) Leer lo disponible (no bloqueante). Si el staging está lleno no leemos:
+  //    el window TCP frena al servidor, no se pierde nada.
+  if (tcp_client_ && audio_rx_len_ < AUDIO_RX_SIZE) {
+    ssize_t n = tcp_client_->read(audio_rx_ + audio_rx_len_,
+                                  AUDIO_RX_SIZE - audio_rx_len_);
+    if (n > 0) {
+      audio_rx_len_ += static_cast<size_t>(n);
+    } else if (n == 0) {
+      tcp_client_->close();
+      tcp_client_.reset();
+    } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+      ESP_LOGW(TAG, "Audio stream read error: %d", errno);
+      tcp_client_->close();
+      tcp_client_.reset();
     }
-
-  } else if (n == 0) {
-    // Fin de stream — el servidor cerró
-    if (speaker_ != nullptr) speaker_->finish();
-    is_playing_ = false;
-    opus_bytes_remaining_ = 0;
-  } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-    // No hay más datos por ahora — volver en el próximo loop()
-    // opus_bytes_remaining_ se mantiene en SIZE_MAX hasta CMD_STOP
-  } else {
-    ESP_LOGW(TAG, "Opus stream read error: %d", errno);
-    if (speaker_ != nullptr) speaker_->finish();
-    is_playing_ = false;
-    opus_bytes_remaining_ = 0;
   }
+
+  // 2) Entregar al speaker sólo lo que acepta; el resto espera al próximo loop().
+  //    Sin decoder Opus no hay forma de usar el payload: se descarta.
+  //    Se escribe en múltiplos de 2 bytes para no partir una muestra PCM16.
+  size_t sent = 0;
+  if (compression_type_ != 0 || speaker_ == nullptr) {
+    sent = audio_rx_len_;
+  } else {
+    while (sent < audio_rx_len_) {
+      size_t want = (audio_rx_len_ - sent) & ~static_cast<size_t>(1);
+      if (want == 0) break;  // un byte suelto: esperar la otra mitad
+      size_t written = speaker_->play(audio_rx_ + sent, want, 0);
+      if (written == 0) break;  // ring buffer lleno
+      sent += written;
+    }
+  }
+  if (sent > 0) {
+    audio_rx_len_ -= sent;
+    if (audio_rx_len_ > 0) memmove(audio_rx_, audio_rx_ + sent, audio_rx_len_);
+  }
+
+  // 3) Sin socket y sin pendientes: el mensaje terminó
+  if (tcp_client_ == nullptr && audio_rx_len_ < 2) {
+    audio_rx_len_ = 0;
+    end_audio_stream();
+  }
+}
+
+void OnjuProtocol::end_audio_stream() {
+  audio_streaming_        = false;
+  speaker_finish_pending_ = true;
+  speaker_empty_since_ms_ = 0;
+  // No finish() acá: el speaker todavía tiene audio sin reproducir (se cortaría
+  // hasta ~400 ms). loop() lo cierra cuando el grafo queda vacío.
 }
 
 // ── handle_led_command() ──────────────────────────────────────────────────
@@ -408,7 +446,9 @@ void OnjuProtocol::handle_stop_command() {
   uint16_t hold_s = (header_buf_[1] << 8) | header_buf_[2];
   ESP_LOGI(TAG, "CMD_STOP: hold=%ds", hold_s);
   is_playing_                  = false;
-  opus_bytes_remaining_        = 0;   // FIX #4: cancelar drain
+  audio_streaming_             = false;  // cancelar el drain del payload
+  audio_rx_len_                = 0;
+  speaker_finish_pending_      = false;
   server_stopped_speaking_at_  = millis();
   if (speaker_ != nullptr) speaker_->finish();
 }
@@ -514,7 +554,13 @@ void OnjuProtocol::check_barge_in(const int16_t *samples, size_t count) {
 void OnjuProtocol::trigger_barge_in() {
   barging_in_ = true;
   is_playing_ = false;
-  opus_bytes_remaining_ = 0;
+  // Si el payload seguía llegando, cortarlo: si no, sus bytes se leerían como headers.
+  audio_streaming_ = false;
+  audio_rx_len_ = 0;
+  if (tcp_client_) {
+    tcp_client_->close();
+    tcp_client_.reset();
+  }
   ESP_LOGI(TAG, "Barge-in triggered");
 }
 
