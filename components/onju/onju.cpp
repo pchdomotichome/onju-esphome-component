@@ -248,8 +248,10 @@ void OnjuProtocol::loop() {
     }
   }
 
-  // Cerrar el stream anterior sólo cuando el grafo ya reprodujo todo:
-  // finish() corta lo que quedó aguas abajo (mixer 250 ms + hardware 100 ms).
+  // Cerrar el stream anterior sólo cuando el grafo ya reprodujo todo y no llegó
+  // audio nuevo: finish() deja el resampler en STOPPING/STOPPED, y mientras tanto
+  // play() no acepta bytes (se traba el drenaje y con él el accept de la próxima
+  // conexión: 1 chunk perdido cada vez). 2 s de silencio: el TTS no deja gaps así.
   if (speaker_finish_pending_) {
     if (speaker_ == nullptr) {
       speaker_finish_pending_ = false;
@@ -258,7 +260,7 @@ void OnjuProtocol::loop() {
       speaker_empty_since_ms_ = 0;
     } else if (speaker_empty_since_ms_ == 0) {
       speaker_empty_since_ms_ = millis();
-    } else if (millis() - speaker_empty_since_ms_ > 400) {
+    } else if (millis() - speaker_empty_since_ms_ > 2000) {
       speaker_->finish();
       speaker_finish_pending_ = false;
       is_playing_ = false;
@@ -351,6 +353,7 @@ void OnjuProtocol::handle_audio_command() {
 
   // FIX #2: el payload sigue al header; termina con EOF (una conexión por mensaje)
   audio_streaming_ = true;
+  audio_started_ms_ = millis();
   speaker_finish_pending_ = false;  // hay audio nuevo: no cerrar el stream anterior
 
   // El volumen real del grafo (resampler → mixer → hardware) sale del byte 'vol'.
@@ -416,6 +419,15 @@ void OnjuProtocol::drain_audio_stream() {
 
   // 3) Sin socket y sin pendientes: el mensaje terminó
   if (tcp_client_ == nullptr && audio_rx_len_ < 2) {
+    audio_rx_len_ = 0;
+    end_audio_stream();
+    return;
+  }
+  // Seguro: un cliente que deja la conexión abierta para siempre no debe dejar el
+  // device sin aceptar más conexiones.
+  if (millis() - audio_started_ms_ > 20000) {
+    ESP_LOGW(TAG, "Audio stream sin progreso: se corta");
+    if (tcp_client_) { tcp_client_->close(); tcp_client_.reset(); }
     audio_rx_len_ = 0;
     end_audio_stream();
   }

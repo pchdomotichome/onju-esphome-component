@@ -110,6 +110,7 @@ class OnjuProtocol : public Component {
   bool     audio_streaming_        = false;  // leyendo el payload de CMD_AUDIO
   bool     speaker_finish_pending_ = false;  // payload terminado, speaker aún drenando
   uint32_t speaker_empty_since_ms_ = 0;
+  uint32_t audio_started_ms_       = 0;      // inicio del stream actual (seguro anti-traba)
   uint8_t  compression_type_       = 0;      // 0 = PCM16 crudo, 2 = Opus (no soportado)
 
   // FIX #3: estado de lectura TCP no bloqueante
