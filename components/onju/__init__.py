@@ -11,7 +11,7 @@ Preserves the real onju wire protocol:
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import microphone, speaker
+from esphome.components import light, microphone, speaker
 from esphome.const import CONF_ID
 
 AUTO_LOAD = []
@@ -38,6 +38,7 @@ CONF_LED_COUNT            = "led_count"
 CONF_HOST_NAME            = "host_name"
 CONF_MICROPHONE           = "microphone"
 CONF_SPEAKER              = "speaker"
+CONF_LED_LIGHT            = "led_light"
 
 CONFIG_SCHEMA = cv.Schema(
     {
@@ -51,14 +52,15 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_UDP_PORT,            default=3000):   cv.port,
         cv.Optional(CONF_TCP_PORT,            default=3001):   cv.port,
         cv.Optional(CONF_DEFAULT_MIC_TIMEOUT, default=5000):   cv.positive_int,
-        cv.Optional(CONF_SPEAKER_VOLUME,      default=14):     cv.int_range(min=0, max=20),
+        cv.Optional(CONF_SPEAKER_VOLUME,      default=14):     cv.int_range(min=0, max=31),
         cv.Optional(CONF_PTT_MODE,            default=False):  cv.boolean,
         cv.Optional(CONF_BARGE_IN_RMS,        default=3500.0): cv.float_,
         cv.Optional(CONF_BARGE_IN_HOLDOFF,    default=3):      cv.positive_int,
-        cv.Optional(CONF_BARGE_IN_MAX_VOLUME, default=14):     cv.int_range(min=0, max=20),
+        cv.Optional(CONF_BARGE_IN_MAX_VOLUME, default=14):     cv.int_range(min=0, max=31),
         cv.Optional(CONF_SAMPLE_CHUNK_SIZE,   default=512):    cv.positive_int,
         cv.Optional(CONF_MIC_GAIN,            default=2):      cv.positive_int,
         cv.Optional(CONF_LED_COUNT,           default=6):      cv.positive_int,
+        cv.Optional(CONF_LED_LIGHT):                            cv.use_id(light.LightState),
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -86,3 +88,5 @@ async def to_code(config):
     cg.add(var.set_sample_chunk_size(config[CONF_SAMPLE_CHUNK_SIZE]))
     cg.add(var.set_mic_gain(config[CONF_MIC_GAIN]))
     cg.add(var.set_led_count(config[CONF_LED_COUNT]))
+    if CONF_LED_LIGHT in config:
+        cg.add(var.set_led_light(await cg.get_variable(config[CONF_LED_LIGHT])))

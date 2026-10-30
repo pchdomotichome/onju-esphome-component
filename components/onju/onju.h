@@ -6,6 +6,7 @@
 // FIX #1, #6: includes de audio
 #include "esphome/components/microphone/microphone.h"
 #include "esphome/components/speaker/speaker.h"
+#include "esphome/components/light/light_state.h"
 
 namespace esphome {
 namespace onju {
@@ -30,6 +31,7 @@ class OnjuProtocol : public Component {
   void set_sample_chunk_size(size_t s)          { sample_chunk_size_ = s; }
   void set_mic_gain(int g)                      { mic_gain_ = g; }
   void set_led_count(uint8_t c)                 { led_count_ = c; }
+  void set_led_light(light::LightState *l)      { led_light_ = l; }
 
   // FIX #5: setter de config separado de la lógica de runtime
   void set_default_mic_timeout_ms(uint32_t ms) { default_mic_timeout_ms_ = ms; }
@@ -85,6 +87,9 @@ class OnjuProtocol : public Component {
   size_t   sample_chunk_size_     = 512;
   int      mic_gain_              = 2;
   uint8_t  led_count_             = 6;
+  // Volumen aplicado por última vez desde el header: el touch puede cambiarlo
+  // sin que el siguiente chunk (mismo 'vol') lo vuelva a pisar.
+  uint8_t  applied_volume_        = 0xFF;
 
   // ── Estado ────────────────────────────────────────────────────────────
   bool     is_playing_            = false;
@@ -95,6 +100,7 @@ class OnjuProtocol : public Component {
   uint8_t  led_r_ = 0, led_g_ = 0, led_b_ = 0;
   uint16_t led_level_             = 0;
   uint8_t  led_fade_              = 5;
+  light::LightState *led_light_{nullptr};
   uint32_t server_stopped_speaking_at_ = 0;
 
   // ── Buffers de audio ──────────────────────────────────────────────────

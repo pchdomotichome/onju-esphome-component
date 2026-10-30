@@ -363,8 +363,11 @@ void OnjuProtocol::handle_audio_command() {
 
   // El volumen real del grafo (resampler → mixer → hardware) sale del byte 'vol'.
   // vol=0 lo usa el servidor para reabrir el mic sin audio: no pisamos el volumen.
-  if (speaker_ != nullptr && speaker_volume_ > 0) {
+  // Sólo se aplica cuando el byte cambia: si el pipeline repite el mismo valor,
+  // el ajuste local del touch sobrevive entre chunks.
+  if (speaker_ != nullptr && speaker_volume_ > 0 && speaker_volume_ != applied_volume_) {
     speaker_->set_volume(speaker_volume_ / 31.0f);
+    applied_volume_ = speaker_volume_;
   }
 
   // TTS: si el server manda PCM16 crudo (16kHz mono), preparar el speaker.
@@ -586,6 +589,19 @@ void OnjuProtocol::set_led(uint8_t r, uint8_t g, uint8_t b,
                             uint8_t level, uint8_t fade) {
   led_r_ = r; led_g_ = g; led_b_ = b;
   led_level_ = level; led_fade_ = fade;
+  if (led_light_ == nullptr) {
+    return;
+  }
+  auto call = led_light_->make_call();
+  if (level == 0) {
+    call.set_state(false);
+  } else {
+    call.set_state(true);
+    call.set_rgb(r / 255.0f, g / 255.0f, b / 255.0f);
+    call.set_brightness(level / 255.0f);
+  }
+  call.set_transition_length(fade * 100);
+  call.perform();
 }
 
 // ── dump_config() ─────────────────────────────────────────────────────────
