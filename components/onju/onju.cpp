@@ -223,16 +223,21 @@ void OnjuProtocol::setup_mic_callback() {
 // ── loop() ──────────────────────────────────────────────────────────────
 void OnjuProtocol::loop() {
   // FIX #3: accept() non-blocking (no usa ready() ni accept_loop_monitored)
-  // No aceptar otra conexión con el payload anterior a medio leer: close() en el
-  // accept() descartaría la cola que quedó en el buffer de recepción del socket.
-  if (tcp_server_ && !audio_streaming_) {
+  // Se acepta siempre: el pipeline abre una conexión por chunk de TTS y si el SYN
+  // se pierde, el reintento agrega ~1 s de hueco. El mensaje anterior se drena
+  // antes de cerrarlo para no perder los bytes ya recibidos.
+  if (tcp_server_) {
     struct sockaddr_storage source_addr;
     socklen_t addr_len = sizeof(source_addr);
     auto sock = tcp_server_->accept(
         reinterpret_cast<struct sockaddr *>(&source_addr), &addr_len);
     if (sock) {
       if (tcp_client_) {
-        tcp_client_->close();
+        if (audio_streaming_) {
+          drain_audio_stream();
+          end_audio_stream();
+        }
+        if (tcp_client_) { tcp_client_->close(); tcp_client_.reset(); }
       }
       tcp_client_ = std::move(sock);
       tcp_client_->setblocking(false);
@@ -268,15 +273,12 @@ void OnjuProtocol::loop() {
   }
 
   // FIX #3 + #4: leer TCP de forma no bloqueante
-  if (tcp_client_) {
-    if (audio_streaming_) {
-      drain_audio_stream();
-    } else {
-      // Intentar completar el header de 6 bytes
-      poll_tcp_header();
-    }
-  } else if (audio_streaming_) {
-    drain_audio_stream();  // sin socket: sólo queda entregar el staging
+  // Hay staging pendiente aunque el stream ya terminó: seguir entregándolo.
+  if (audio_streaming_ || audio_rx_len_ > 0) {
+    drain_audio_stream();
+  } else if (tcp_client_) {
+    // Intentar completar el header de 6 bytes
+    poll_tcp_header();
   }
 
   // FIX #9: discovery en socket separado
@@ -382,7 +384,7 @@ void OnjuProtocol::handle_audio_command() {
 void OnjuProtocol::drain_audio_stream() {
   // 1) Leer lo disponible (no bloqueante). Si el staging está lleno no leemos:
   //    el window TCP frena al servidor, no se pierde nada.
-  if (tcp_client_ && audio_rx_len_ < AUDIO_RX_SIZE) {
+  if (audio_streaming_ && tcp_client_ && audio_rx_len_ < AUDIO_RX_SIZE) {
     ssize_t n = tcp_client_->read(audio_rx_ + audio_rx_len_,
                                   AUDIO_RX_SIZE - audio_rx_len_);
     if (n > 0) {
@@ -420,12 +422,12 @@ void OnjuProtocol::drain_audio_stream() {
   // 3) Sin socket y sin pendientes: el mensaje terminó
   if (tcp_client_ == nullptr && audio_rx_len_ < 2) {
     audio_rx_len_ = 0;
-    end_audio_stream();
+    if (audio_streaming_) end_audio_stream();
     return;
   }
   // Seguro: un cliente que deja la conexión abierta para siempre no debe dejar el
   // device sin aceptar más conexiones.
-  if (millis() - audio_started_ms_ > 20000) {
+  if (audio_streaming_ && millis() - audio_started_ms_ > 20000) {
     ESP_LOGW(TAG, "Audio stream sin progreso: se corta");
     if (tcp_client_) { tcp_client_->close(); tcp_client_.reset(); }
     audio_rx_len_ = 0;
